@@ -14,7 +14,7 @@ type SftpClient interface {
 	Remove(path string) error
 	Stat(p string) (os.FileInfo, error)
 	OpenFile(path string) (io.ReadCloser, error)
-	CreateFile(path string) (io.Writer, error)
+	CreateFile(path string) (*sftp.File, error)
 	Mkdir(path string) error
 }
 
@@ -26,7 +26,7 @@ func (client *extendedSftpClient) OpenFile(path string) (io.ReadCloser, error) {
 	return client.Open(path)
 }
 
-func (client *extendedSftpClient) CreateFile(path string) (io.Writer, error) {
+func (client *extendedSftpClient) CreateFile(path string) (*sftp.File, error) {
 	return client.Create(path)
 }
 

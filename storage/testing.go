@@ -39,7 +39,8 @@ func RunFolderTest(storageFolder Folder, t *testing.T) {
 	assert.NoError(t, err)
 	t.Log(subFolders[0].GetPath())
 	assert.Equal(t, "file0", objects[0].GetName())
-	assert.True(t, strings.HasSuffix(subFolders[0].GetPath(), "Sub1/"))
+	assert.True(t, strings.HasSuffix(subFolders[0].GetPath(), "Sub1/") ||
+		strings.HasSuffix(subFolders[0].GetPath(), "Sub1"))
 
 	sublist, subFolders, err := sub1.ListFolder()
 	assert.NoError(t, err)
