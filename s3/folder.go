@@ -1,7 +1,9 @@
 package s3
 
 import (
+	"fmt"
 	"io"
+	"path"
 	"strconv"
 	"strings"
 
@@ -10,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/pkg/errors"
-	"github.com/wal-g/storages/storage"
+	"github.com/wal-g/wal-g/pkg/storages/storage"
 )
 
 const (
@@ -36,6 +38,7 @@ const (
 	EndpointPortSetting      = "S3_ENDPOINT_PORT"
 	LogLevel                 = "S3_LOG_LEVEL"
 	UseListObjectsV1         = "S3_USE_LIST_OBJECTS_V1"
+	RangeBatchSize           = "S3_RANGE_BATCH_SIZE"
 )
 
 var (
@@ -60,6 +63,7 @@ var (
 		s3CertFile,
 		MaxPartSize,
 		UseListObjectsV1,
+		RangeBatchSize,
 	}
 )
 
@@ -125,6 +129,8 @@ func ConfigureFolder(prefix string, settings map[string]string) (storage.Folder,
 
 	folder := NewFolder(*uploader, client, bucket, path, useListObjectsV1)
 	folder.settings = settings
+	fmt.Printf("SETTING %+v\n", settings)
+	fmt.Printf("SETTING_2 %+v\n", settings)
 
 	return folder, nil
 }
@@ -150,6 +156,153 @@ func (folder *Folder) PutObject(name string, content io.Reader) error {
 	return folder.uploader.upload(*folder.Bucket, folder.Path+name, content)
 }
 
+func (folder *Folder) CopyObject(srcPath string, dstPath string) error {
+	if exists, err := folder.Exists(srcPath); !exists {
+		if err == nil {
+			return errors.New("object does not exist")
+		} else {
+			return err
+		}
+	}
+	source := path.Join(*folder.Bucket, folder.Path, srcPath)
+	dst := path.Join(folder.Path, dstPath)
+	input := &s3.CopyObjectInput{CopySource: &source, Bucket: folder.Bucket, Key: &dst}
+	_, err := folder.S3API.CopyObject(input)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type s3Reader struct {
+	ob            *s3.GetObjectOutput
+	folder        *Folder
+	contentLength int64
+	objectPath    string
+	storageCursor int64
+	cache         []byte
+	cacheCursor   int64
+	cacheSize     int64
+}
+
+func (reader *s3Reader) getObjectRange(from, to int64) (*s3.GetObjectOutput, error) {
+	bytesRange := fmt.Sprintf("bytes=%d-%d", from, to)
+	input := &s3.GetObjectInput{
+		Bucket: reader.folder.Bucket,
+		Key:    aws.String(reader.objectPath),
+		Range:  aws.String(bytesRange),
+	}
+
+	fmt.Printf("GET RANGE %s\n", bytesRange)
+
+	return reader.folder.S3API.GetObject(input)
+}
+
+func (reader *s3Reader) ReadToCache() (err error) {
+	// we try to take one more bit, I'm trying to avoid EOF in Range requests
+	end := reader.storageCursor + reader.cacheSize + 1
+	if end >= reader.contentLength {
+		end = reader.contentLength
+	}
+
+	from := reader.storageCursor
+	to := end - 1
+	object, err := reader.getObjectRange(from, to)
+	if err != nil {
+		fmt.Printf("GET GetObject returned error: %s\n", err)
+		return err
+	}
+	defer func() { _ = object.Body.Close() }()
+
+	nval, err1 := object.Body.Read(reader.cache)
+	if err1 != nil && err1 != io.EOF {
+		return err1
+	}
+	if nval > 0 {
+		fmt.Printf("move cursor %d + %d\n", reader.storageCursor, nval)
+		reader.storageCursor += int64(nval)
+	}
+	return err1
+}
+
+func (reader *s3Reader) copyBuf(p []byte, from int) int {
+	size:= int64(len(p[from:]))
+	readto := reader.cacheCursor + size
+	if readto > reader.cacheSize {
+		readto = reader.cacheSize
+	}
+
+	fmt.Printf("copy %d\n", len(p))
+	n := copy(p[from:], reader.cache[reader.cacheCursor:readto])
+	fmt.Printf("from %d [%d] -- [%d | %d]\n", from, len(p), reader.cacheCursor, readto)
+	reader.cacheCursor = readto
+
+	if reader.cacheCursor >= reader.cacheSize {
+		reader.cacheCursor = 0
+		reader.cache = nil
+		fmt.Printf("reset cache\n")
+	}
+	return n
+}
+
+func (reader *s3Reader) refillCache() error {
+	var cacheError error = nil
+	if reader.cache == nil {
+		fmt.Printf("Refill cache\n")
+		reader.cache = make([]byte, reader.cacheSize)
+		cacheError = reader.ReadToCache()
+		if cacheError != nil && cacheError != io.EOF {
+			fmt.Printf("return error %s", cacheError)
+			return cacheError
+		}
+	}
+	return cacheError
+}
+
+func (reader *s3Reader) Read(p []byte) (n int, err error) {
+	fmt.Printf("HELLO READ %d\n", len(p))
+	totalRead := 0
+	err = reader.refillCache()
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+
+	if err == io.EOF {
+		fmt.Printf("EOF EOF EOF\n")
+	}
+
+	i := reader.copyBuf(p, 0)
+	totalRead += i
+	for totalRead < len(p)  {
+		fmt.Printf("[total] %d < %d : %d\n", totalRead, len(p), i)
+		err = reader.refillCache()
+		if err == io.EOF {
+			fmt.Printf("EOF EOF EOF\n")
+		}
+		if err != nil && err != io.EOF {
+			return totalRead, err
+		}
+
+		i := reader.copyBuf(p, totalRead)
+		totalRead += i
+
+	}
+	var er error = nil
+	//totalRead, er := reader.ob.Body.Read(p)
+	l := string(p)
+	if len(l) > 40 {
+		l = l[0:40] + "..."
+	}
+	fmt.Printf("copy buf [%d] %d: %s\n", len(p), totalRead, er)
+	fmt.Printf("copy buf detail [%d] %v %d: %s\n", len(p), p, totalRead, er)
+	return totalRead, nil
+	//return x, y
+}
+
+func (reader *s3Reader) Close() (err error) {
+	return nil
+}
+
 func (folder *Folder) ReadObject(objectRelativePath string) (io.ReadCloser, error) {
 	objectPath := folder.Path + objectRelativePath
 	input := &s3.GetObjectInput{
@@ -164,12 +317,22 @@ func (folder *Folder) ReadObject(objectRelativePath string) (io.ReadCloser, erro
 		}
 		return nil, errors.Wrapf(err, "failed to read object: '%s' from S3", objectPath)
 	}
-	return object.Body, nil
+
+	rangeBatchSize := int64(1024)
+	fmt.Printf("setting %v\n", folder.settings)
+	if batchSize, ok := folder.settings[RangeBatchSize]; ok {
+		if iBatchSize, err := strconv.Atoi(batchSize); err == nil {
+			rangeBatchSize = int64(iBatchSize)
+		}
+	}
+	return &s3Reader{objectPath: objectPath, ob: object, cacheSize: rangeBatchSize, contentLength: *object.ContentLength, folder: folder}, nil
 }
 
 func (folder *Folder) GetSubFolder(subFolderRelativePath string) storage.Folder {
-	return NewFolder(folder.uploader, folder.S3API, *folder.Bucket,
+	subFolder := NewFolder(folder.uploader, folder.S3API, *folder.Bucket,
 		storage.JoinPath(folder.Path, subFolderRelativePath)+"/", folder.useListObjectsV1)
+	subFolder.settings = folder.settings
+	return subFolder
 }
 
 func (folder *Folder) GetPath() string {
@@ -179,8 +342,10 @@ func (folder *Folder) GetPath() string {
 func (folder *Folder) ListFolder() (objects []storage.Object, subFolders []storage.Folder, err error) {
 	listFunc := func(commonPrefixes []*s3.CommonPrefix, contents []*s3.Object) {
 		for _, prefix := range commonPrefixes {
-			subFolders = append(subFolders, NewFolder(folder.uploader, folder.S3API, *folder.Bucket,
-				*prefix.Prefix, folder.useListObjectsV1))
+			subFolder := NewFolder(folder.uploader, folder.S3API, *folder.Bucket,
+				*prefix.Prefix, folder.useListObjectsV1)
+			subFolder.settings = folder.settings
+			subFolders = append(subFolders, subFolder)
 		}
 		for _, object := range contents {
 			// Some storages return root tar_partitions folder as a Key.
